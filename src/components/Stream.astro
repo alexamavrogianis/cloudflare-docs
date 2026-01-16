@@ -154,7 +154,30 @@ if (thumbnail) {
 
 	declare function Stream(player: HTMLIFrameElement): HTMLVideoElement;
 
+	const TELEMETRY_ENDPOINT = "https://video-analytics.pcx-team.workers.dev/api/telemetry";
+
+	function newSessionId(): string {
+		if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+			return crypto.randomUUID();
+		}
+		return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+	}
+
+	function getProductArea(): string {
+		const path = window.location.pathname;
+		const segments = path.split("/").filter(Boolean);
+		return segments[0] || "unknown";
+	}
+
 	class StreamPlayer extends HTMLElement {
+		private sessionId = newSessionId();
+		private watchSeconds = 0;
+		private maxPercentWatched = 0;
+		private lastTickMs: number | null = null;
+		private lastTime = 0;
+		private playing = false;
+		private flushed = false;
+
 		connectedCallback() {
 			const id = CSS.escape(this.dataset.id as string);
 			const title = this.dataset.title as string;
@@ -162,11 +185,89 @@ if (thumbnail) {
 			const player = this.querySelector(`#${id}`) as HTMLIFrameElement;
 			const stream = Stream(player);
 
+			const tick = () => {
+				const nowMs = Date.now();
+				const current = Number.isFinite(stream.currentTime) ? stream.currentTime : 0;
+				const duration = Number.isFinite(stream.duration) ? stream.duration : 0;
+
+				if (duration > 0) {
+					const pct = Math.min(Math.max(current / duration, 0), 1);
+					this.maxPercentWatched = Math.max(this.maxPercentWatched, pct);
+				}
+
+				if (!this.playing) {
+					this.lastTime = current;
+					this.lastTickMs = nowMs;
+					return;
+				}
+
+				if (this.lastTickMs == null) {
+					this.lastTickMs = nowMs;
+					this.lastTime = current;
+					return;
+				}
+
+				const dt = (nowMs - this.lastTickMs) / 1000;
+				this.lastTickMs = nowMs;
+
+				const dtime = current - this.lastTime;
+				this.lastTime = current;
+
+				if (dt > 0 && dt < 10 && dtime >= 0 && dtime < 10) {
+					this.watchSeconds += dt;
+				}
+			};
+
+			const flush = () => {
+				if (this.flushed) return;
+				const duration = Number.isFinite(stream.duration) ? stream.duration : 0;
+				if (this.watchSeconds <= 0 || duration <= 0) return;
+
+				this.flushed = true;
+
+				const payload = {
+					events: [
+						{
+							timestamp: new Date().toISOString(),
+							sessionId: this.sessionId,
+							videoId: this.dataset.id,
+							docPath: window.location.pathname,
+							docTitle: title,
+							productArea: getProductArea(),
+							durationSeconds: duration,
+							watchSeconds: Math.max(0, this.watchSeconds),
+							maxPercentWatched: this.maxPercentWatched,
+						},
+					],
+				};
+
+				try {
+					navigator.sendBeacon(
+						TELEMETRY_ENDPOINT,
+						new Blob([JSON.stringify(payload)], { type: "application/json" })
+					);
+				} catch {
+					fetch(TELEMETRY_ENDPOINT, {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify(payload),
+						keepalive: true,
+					}).catch(() => {});
+				}
+			};
+
 			stream.addEventListener("play", () => {
+				this.playing = true;
+				this.lastTickMs = null;
+				this.flushed = false;
+				tick();
 				track("play docs video", { title });
 			});
 
 			stream.addEventListener("pause", () => {
+				this.playing = false;
+				tick();
+				flush();
 				track("paused docs video", {
 					title,
 					time: stream.currentTime.toFixed(1),
@@ -181,6 +282,9 @@ if (thumbnail) {
 			});
 
 			stream.addEventListener("ended", () => {
+				this.playing = false;
+				tick();
+				flush();
 				track("ended docs video", { title });
 			});
 
@@ -191,6 +295,14 @@ if (thumbnail) {
 					title,
 					rate: stream.playbackRate,
 				});
+			});
+
+			stream.addEventListener("timeupdate", tick);
+
+			window.addEventListener("pagehide", () => {
+				this.playing = false;
+				tick();
+				flush();
 			});
 
 			const buttons =
